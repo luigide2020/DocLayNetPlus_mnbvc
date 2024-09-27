@@ -259,13 +259,10 @@ def crop_and_convert_to_bytes(image, bbox):
 
 
 def convert_to_parquet(dataset, output_file):
-    dataset_list = list(dataset)
-    dataset_list.sort(key=lambda x: (x['doc_name'], x['page_no']))
-    sorted_generator = iter(dataset_list)
     converted_data = []
     block_counter = {}
 
-    for item in sorted_generator:
+    for item in dataset:
         doc_key = item['doc_name']
         if doc_key not in block_counter:
             block_counter[doc_key] = 0
@@ -313,7 +310,7 @@ def convert_to_parquet(dataset, output_file):
             converted_data.append(row)
             block_counter[doc_key] += 1
 
-    df = pd.DataFrame(converted_data).head(100)
+    df = pd.DataFrame(converted_data)
     table = pa.Table.from_pandas(df)
     pq.write_table(table, output_file)
 
@@ -324,4 +321,5 @@ merged_ds = concatenate_datasets(all_subsets)
 processed_merged_ds = merged_ds.map(process_sample)
 processed_merged_ds_with_column_num = processed_merged_ds.map(determine_column_layout)
 processed_merged_ds_sorted = processed_merged_ds_with_column_num.map(sort_pdf_objects)
-convert_to_parquet(processed_merged_ds_sorted, 'output.parquet')
+processed_merged_ds_page_sorted = processed_merged_ds_sorted.sort(["doc_name", "page_no"])
+convert_to_parquet(processed_merged_ds_page_sorted, 'output.parquet')
