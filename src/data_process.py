@@ -1,5 +1,6 @@
 import hashlib
 import io
+import os
 import json
 from collections import defaultdict
 from datetime import datetime
@@ -9,6 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import load_dataset
 from datasets import concatenate_datasets
+from tqdm import tqdm
 
 
 def is_cell_in_object(cell_bbox, object_bbox, alpha=0.1):
@@ -258,62 +260,79 @@ def crop_and_convert_to_bytes(image, bbox):
     return img_byte_arr.getvalue()
 
 
-def convert_to_parquet(dataset, output_file):
-    converted_data = []
+def convert_to_parquet(dataset, output_dir='./output', batch_size=1000, row_group_size=1000):
+    TARGET_FILE_SIZE = 300 * 1024 * 1024  # 300 MB
     block_counter = {}
+    file_counter = 0
+    current_data = []
 
-    for item in dataset:
-        doc_key = item['doc_name']
-        if doc_key not in block_counter:
-            block_counter[doc_key] = 0
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-        current_time = datetime.now().strftime("%Y%m%d")
+    category_name = ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title']
 
-        extended_fields = {
-            'doc_category': item['doc_category'],
-            'collection': item['collection'],
-            'page_no': item['page_no'],
-            'width': item['width'],
-            'height': item['height']
-        }
+    for i in tqdm(range(0, len(dataset), batch_size)):
+        batch = dataset.select(range(i, min(i+batch_size, len(dataset))))
 
-        original_image = item['image']  # PIL Image对象
+        for item in batch:
+            doc_key = item['doc_name']
+            if doc_key not in block_counter:
+                block_counter[doc_key] = 0
 
-        for obj in item['objects']:
-            block_id = block_counter[doc_key]
-
-            # 裁剪图片并转换为字节
-            image_content = crop_and_convert_to_bytes(original_image, obj['bbox'])
-
-            category_id = obj['category_id']
-            category_name = ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture',
-                             'Section-header', 'Table', 'Text', 'Title']
-            block_type = category_name[category_id]
-            extended_fields['bbox'] = obj['bbox']
-
-            row = {
-                '实体ID': item['doc_name'],
-                '块ID': block_id,
-                '时间': current_time,
-                '扩展字段': json.dumps(extended_fields),
-                '文本': obj['text'],
-                '图片': image_content,
-                'OCR文本': json.dumps(obj['cells']),  # 使用原始文本以及bbox作为OCR文本
-                '音频': None,
-                'STT文本': None,
-                '其它块': None,
-                '块类型': block_type,
-                '文件md5': hashlib.md5(item['doc_name'].encode()).hexdigest(),
-                '页ID': item['page_no']
+            current_time = datetime.now().strftime("%Y%m%d")
+            extended_fields = {
+                'doc_category': item['doc_category'],
+                'collection': item['collection'],
+                'page_no': item['page_no'],
+                'width': item['width'],
+                'height': item['height']
             }
 
-            converted_data.append(row)
-            block_counter[doc_key] += 1
+            original_image = item['image']
 
-    df = pd.DataFrame(converted_data)
-    table = pa.Table.from_pandas(df)
-    pq.write_table(table, output_file)
+            for obj in item['objects']:
+                block_id = block_counter[doc_key]
+                image_content = crop_and_convert_to_bytes(original_image, obj['bbox'])
+                block_type = category_name[obj['category_id']]
+                extended_fields['bbox'] = obj['bbox']
 
+                row = {
+                    '实体ID': item['doc_name'],
+                    '块ID': block_id,
+                    '时间': current_time,
+                    '扩展字段': json.dumps(extended_fields),
+                    '文本': obj['text'],
+                    '图片': image_content,
+                    'OCR文本': json.dumps(item['cells']),
+                    '音频': None,
+                    'STT文本': None,
+                    '其它块': None,
+                    '块类型': block_type,
+                    'md5': hashlib.md5(item['doc_name'].encode()).hexdigest(),
+                    '页ID': item['page_no']
+                }
+
+                current_data.append(row)
+                block_counter[doc_key] += 1
+
+        # 批量处理后估算大小
+        if len(current_data) >= batch_size:
+            df = pd.DataFrame(current_data)
+            current_size = df.memory_usage(deep=True).sum()
+
+            if current_size >= TARGET_FILE_SIZE:
+                output_file = f"{output_dir}/output_part_{file_counter}.parquet"
+                df.to_parquet(output_file, engine='pyarrow', row_group_size=row_group_size)
+                print(f"Parquet file written: {output_file}, size: {os.path.getsize(output_file) / (1024 * 1024):.2f} MB")
+                current_data = []
+                file_counter += 1
+
+    # 处理剩余的数据
+    if current_data:
+        df = pd.DataFrame(current_data)
+        output_file = f"{output_dir}/output_part_{file_counter}.parquet"
+        df.to_parquet(output_file, engine='pyarrow', row_group_size=row_group_size)
+        print(f"Final Parquet file written: {output_file}, size: {os.path.getsize(output_file) / (1024 * 1024):.2f} MB")
 
 original_dataset = load_dataset("localDocLayNet.py",local_path="./")
 all_subsets = [original_dataset['train'], original_dataset['validation'], original_dataset['test']]
@@ -322,4 +341,4 @@ processed_merged_ds = merged_ds.map(process_sample)
 processed_merged_ds_with_column_num = processed_merged_ds.map(determine_column_layout)
 processed_merged_ds_sorted = processed_merged_ds_with_column_num.map(sort_pdf_objects)
 processed_merged_ds_page_sorted = processed_merged_ds_sorted.sort(["doc_name", "page_no"])
-convert_to_parquet(processed_merged_ds_page_sorted, 'output.parquet')
+convert_to_parquet(processed_merged_ds_page_sorted)
